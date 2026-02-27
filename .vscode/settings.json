@@ -3,6 +3,6 @@
     "*.cu": "cuda-cpp",
     "*.cuh": "cuda-cpp"
   },
-  "python.languageServer": "None",
-  "ty.python.pythonPath": ".venv/bin/python"
+  // "python.languageServer": "None",
+  // "ty.python.pythonPath": ".venv/bin/python"
 }
