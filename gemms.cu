@@ -88,11 +88,13 @@ __device__ void processFromSmem(float *regM, float *regN, float *threadResults, 
         /* this is a lot so let me break it down: 
         As is BM * BK, and stored transposed. This means BM rows, BK cols.
         what is in As? The tile that the current block is!
-        so we have a whole tile in As. Thus, first we must index along the BK dimension,
-        as this is 
-        dotidx * BM = we're at the start of the tile and getting to the warp that we care about 
-        warpRow * WM = we're at the start of the warp we care about getting to the row in the warp where our thread is
-        wSubtileRowIdx * WSUBM = we're at the col (bc transpose) in warp where our thread is, and want to TODO: i need to think / read more on this
+        so we have a whole tile in As. Thus, first we must index along the BK dimension.
+        left to right: in regM, need to fill in row wSubtileRowIdx, col i, so TM is thread reg row len, classic row-major indexing.
+        Then for As: dotIdx is row number in block of M axis, mult with BM is more row major. now down to "row" that current warp is responsible for:
+        warpRow * WM is row major of the "row" that the warp is current working on (by our design, one row at a time).
+        wSubtileRowIdx * WSUBM is again "row" within the current data that the warp is working on, again based on how big our register acc is
+        threadRowInWarp * TM is more obvious,  warp is working on the "row" of data the warp is working on is imagined in 2D and each thread gets a chunk. 
+        Then add i and get the spot we care about!
         */
         regM[wSubtileRowIdx * TM + i] = As[(dotIdx * BM) + warpRow * WM + wSubtileRowIdx * WSUBM + threadRowInWarp * TM + i];
     }
@@ -107,16 +109,22 @@ __device__ void processFromSmem(float *regM, float *regN, float *threadResults, 
     }
   }
 
-
-
-  // from here, pretending the index calcs + data loading is all done - 
   // time to do the actual warp-tile!
 
   for(int wSubtileRowIdx = 0; wSubtileRowIdx < WMITER; ++wSubtileRowIdx) {
     for(int wSubtileColIdx = 0; wSubtileColIdx < WNITER; ++wSubtileColIdx) {
       for(int resIdxM = 0; resIdxM < TM; ++resIdxM) {
         for(int resIdxN = 0; resIdxN < TN; ++resIdxN) {
-          // TODO: annotate the indexing here
+          /*
+          Indexing explanation for understanding:
+          wSubtileRowIdx is the row index in 2D-land of what chunk of the current assigned work our warp is working on.
+          The work generally exceeds what is possible to do in one step, so we turn each tile into subtiles for the warp.
+          Additionally, on the M axis, we make the math work so that each subtile is just a "row" out of the tile (subtiles ought to divide tiles nicely, so makes sense)
+          Next, thread results is of size WMITER * TM * WNITER * TN, essentially all iterations needed for the warp to cover the data it needs to handle.
+          Thus, wSubtileRowIdx * TM + resIdxM is indexing to the coord specifie by M matrix axis, and similar for N matrix axis.
+          Finally, WNITER * TN is multiplied with the M part because we have WNITER * WMITER subtiles and WMITER is 1, 
+          TN is for the row width for each subtile entry.
+          */
           threadResults[(wSubtileRowIdx * TM + resIdxM) * (WNITER * TN) + (wSubtileColIdx * TN) + resIdxN] = 
           regM[(wSubtileRowIdx * TM) + resIdxM] * regN[(wSubtileColIdx * TN) + resIdxN];
         }
@@ -148,19 +156,14 @@ template <const int BM, const int BN, const int BK, const int WM, const int WN,
 __global__ void __launch_bounds__(NUM_THREADS)
     gemm_kernel_2(int M, int N, int K, float alpha, const float *A, const float *B, float beta, float *C) {
 
-  // the overall goal of this section is to get the indexing of our data correct
-  // row/col within the output tile in C
+  /*
+  tile size == block size? NO! in practice our block is 256 threads, but a tile can be far larger
+  In our case, tile size is BM * BN = 128 * 128 = 16384 output elts, so obv each thread has to do more work than just 1 elt
+  How do we split it up?
+  Consider our case: 16384 / 256 = 64 output elts / thread. each gets 2 8 * 4 subtiles to compute to thread results,
+  and then push back to C. 
+  */
 
-
-
-  // from the top: block to warp to thread indexing
-
-  //tile size == block size? NO! actually idk TODO: figure out the discrepancy that i am missing here
-  // run through the basics: 1 block can have 4 warps active = 128 threads at a time.int
-  // consider 1024 x 1024 matrix.
-  // split into 128 x 128 tiles, 8 x 8 grid of tiles
-  // each SM gets 1 tile because there are more sms than tiles
-  // TODO: think about above as well
   int blockIdxM = blockIdx.x;
   int blockIdxN = blockIdx.y;
 
@@ -169,13 +172,18 @@ __global__ void __launch_bounds__(NUM_THREADS)
   int warpCol = warpIdx % numWarpsN;
   int warpRow = warpIdx / numWarpsN;
 
-  //TODO: grasp what this even means and annotate it
+  /*
+  This indexing feels weird to me, but it just fills the relationship of 
+  WM * WN = WARPSIZE * (WMITER * TM) * (WNITER * TN).                                                                                                       
+  In other words, this is saying the size of the warptile is equivalent to 
+  the size of the work all threads in the warp do.
+  */
   constexpr uint WMITER = (WM * WN) / (WARPSIZE * TM * TN * WNITER);
   constexpr uint WSUBM = WM / WMITER; // 64/2=32
   constexpr uint WSUBN = WN / WNITER; // 32/2=16
   
   int numThreadsPerSubtile = WSUBN / TN;
-  int threadIdxInWarp = threadIdx.x % warpIdx;
+  int threadIdxInWarp = threadIdx.x % WARPSIZE;
   int threadColInWarp = threadIdxInWarp % numThreadsPerSubtile;
   int threadRowInWarp = threadIdxInWarp / numThreadsPerSubtile;
 
@@ -203,7 +211,7 @@ __global__ void __launch_bounds__(NUM_THREADS)
   int innerColB = threadIdx.x % BRowSizeInf4;
 
   // using the smem tiles, use our indices + a short loop on TM, TN to do our acc
-  float threadResults[TM * WMITER * TN * WNITER] = {0.0}
+  float threadResults[TM * WMITER * TN * WNITER] = {0.0};
 
   float regM[WMITER * TM];
   float regN[WNITER * TN];
@@ -223,17 +231,38 @@ __global__ void __launch_bounds__(NUM_THREADS)
   
   // write from the acc to C
   // more for loops!
-  
+  for(int wSubRowIdx = 0; wSubRowIdx < WMITER; ++wSubRowIdx) {
+    for(int wSubColIdx = 0; wSubColIdx < WNITER; ++wSubColIdx) {
+      // set C pointer
+      float *C_moved = C + (wSubRowIdx * WSUBM) * N + wSubColIdx * WSUBN;
+      for(int rthreadRow = 0; rthreadRow < TM; ++rthreadRow) {
+        for(int rthreadCol = 0; rthreadCol < TN; rthreadCol += 4) {
+          float4 tmp = reinterpret_cast<float4 *>(&C_moved[(threadRowInWarp * TM + rthreadRow) * N + threadColInWarp * TN + rthreadCol]);
+
+          const int i = (wSubRowIdx * TM + rthreadRow) * (WNITER * TN) + wSubColIdx * TN + rthreadCol;
+
+          tmp.x = alpha * threadResults[i + 0] + beta * tmp.x;
+          tmp.y = alpha * threadResults[i + 1] + beta * tmp.y;
+          tmp.z = alpha * threadResults[i + 2] + beta * tmp.z;
+          tmp.w = alpha * threadResults[i + 3] + beta * tmp.w;
+
+          reinterpret_cast<float4 *>(
+            &C_moved[(threadRowInWarp * TM + rthreadRow) * N + threadColInWarp * TN + rthreadCol])[0] = tmp;
+          
+        }
+      }
+    }
+  }
   // Done!
 }
 
 extern "C" int gemm_launch_2(const float *A, const float *B, float *C, int M,
                              int N, int K, float alpha, float beta) {
-  dim3 gridDim(CEIL_DIV(M, 32), CEIL_DIV(N, 32), 1);
-  dim3 blockDim(32, 32, 1);
+  dim3 gridDim(CEIL_DIV(M, BM), CEIL_DIV(N, BN), 1);
+  dim3 blockDim(NUM_THREADS, 1, 1);
 
-  // gemm_kernel_2<128, 128, 16, ><<<gridDim, blockDim>>>(M, N, K, alpha, A, B,
-  // beta, C);
+  gemm_kernel_2<128, 128, 16, 64, 32, 2, 8, 4, 256><<<gridDim, blockDim>>>(M, N, K, alpha, A, B,
+  beta, C);
 
   cudaError_t err = cudaGetLastError();
   return int(err);
