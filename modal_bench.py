@@ -5,6 +5,10 @@ Usage:
     modal run modal_bench.py               # benchmark on B200, save results.json
     python plot_bench.py                    # generate PNG graphs from results.json
     python plot_bench.py other_results.json # use a different results file
+
+Benchmark kernels live in `bench/`.
+Shared CUDA helpers live in `include/`.
+Reference kernels live in `reference/` and are not compiled by Modal.
 """
 
 import modal
@@ -26,7 +30,8 @@ cuda_image = (
         "nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.11"
     )
     .pip_install("torch", "apache-tvm-ffi", "flashinfer-python")
-    .add_local_dir(".", "/root/kernels", ignore=lambda pth: not pth.name.endswith(".cu"))
+    .add_local_dir("bench", "/root/kernels/bench")
+    .add_local_dir("include", "/root/kernels/include")
 )
 
 # ---------------------------------------------------------------------------
@@ -64,9 +69,9 @@ class GemmBench:
     def compile_and_load(self):
         """Compile .cu source files into libgemm.so, then auto-discover all
         exported gemm_launch_* functions."""
-        cu_files = sorted(glob.glob("/root/kernels/*.cu"))
+        cu_files = sorted(glob.glob("/root/kernels/bench/*.cu"))
         if not cu_files:
-            raise RuntimeError("No .cu files found in /root/kernels/")
+            raise RuntimeError("No benchmark .cu files found in /root/kernels/bench/")
 
         cmd = [
             "nvcc",
@@ -74,6 +79,7 @@ class GemmBench:
             "-Xcompiler", "-fPIC",
             "-arch=sm_100",
             "-O3",
+            "-I", "/root/kernels/include",
             "-o", "/root/libgemm.so",
         ] + cu_files
         print(f"Compiling: {' '.join(cmd)}")
