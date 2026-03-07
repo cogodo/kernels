@@ -1,8 +1,10 @@
+#ifdef __CLANGD__
 #include <__clang_cuda_builtin_vars.h>
 #include <__clang_cuda_runtime_wrapper.h>
+#endif
 #include <cuda_device_runtime_api.h>
 #include <cuda_runtime.h>
-#include <fstream>
+// #include <fstream>
 #include <stdint.h>
 // #include <algorithm>
 #include <cassert>
@@ -13,7 +15,6 @@
 #define CEIL_DIV(X, Y) (((X) + (Y) - 1) / (Y))
 
 const int WARPSIZE = 32;
-
 // naive kernel, (almost) as simple as can be
 __global__ void gemm_kernel_1(int M, int N, int K, float alpha, const float *A,
                               const float *B, float beta, float *C) {
@@ -55,18 +56,18 @@ __device__ void loadFromGmem(int N, int K, const float *A, const float *B,
   for (uint offset = 0; offset + rowStrideA <= BM; offset += rowStrideA) {
     const float4 tmp = reinterpret_cast<const float4 *>(
         &A[(offset + innerRowA) * K + innerColA * 4])[0];
-    As[(offset + innerColA + 0) * BN + innerRowA * 4] = tmp.x;
-    As[(offset + innerColA + 1) * BN + innerRowA * 4] = tmp.y;
-    As[(offset + innerColA + 2) * BN + innerRowA * 4] = tmp.z;
-    As[(offset + innerColA + 3) * BN + innerRowA * 4] = tmp.w;
+    As[(innerColA * 4 + 0) * BM + innerRowA + offset] = tmp.x;
+    As[(innerColA * 4 + 1) * BM + innerRowA + offset] = tmp.y;
+    As[(innerColA * 4 + 2) * BM + innerRowA + offset] = tmp.z;
+    As[(innerColA * 4 + 3) * BM + innerRowA + offset] = tmp.w;
   }
   // then, load from B - easy
 
   for (uint offset = 0; offset + rowStrideB <= BK; offset += rowStrideB) {
     reinterpret_cast<float4 *>(
-        &Bs[(offset + innerRowB) * N + innerColB * 4])[0] =
+        &Bs[(offset + innerRowB) * BN + innerColB * 4])[0] =
         reinterpret_cast<const float4 *>(
-            &B[(offset + innerRowB) * BN + innerColB * 4])[0];
+            &B[(offset + innerRowB) * N + innerColB * 4])[0];
   }
 }
 
@@ -84,7 +85,7 @@ __device__ void processFromSmem(float *regM, float *regN, float *threadResults, 
     //1. read into regM
     // WMITER is basically the number of times we need the warp on axis M to perform its action
     for(int wSubtileRowIdx = 0; wSubtileRowIdx < WMITER; ++wSubtileRowIdx) {
-      for(int i = 0; i < WSUBM; ++i) {
+      for(int i = 0; i < TM; ++i) {
         /* this is a lot so let me break it down: 
         As is BM * BK, and stored transposed. This means BM rows, BK cols.
         what is in As? The tile that the current block is!
@@ -103,9 +104,9 @@ __device__ void processFromSmem(float *regM, float *regN, float *threadResults, 
   //2. read into regN
   // WSUBN = WN/WNITER = 16 (used to iterate over slices)
   for(int wSubtileColIdx = 0; wSubtileColIdx < WNITER; ++wSubtileColIdx) {
-    for(int i = 0; i < WSUBN; ++i) {
+    for(int i = 0; i < TN; ++i) {
 
-      regN[wSubtileColIdx * TN + i] = Bs[(dotIdx * BN) + warCol * WN + wSubtileColIdx * WSUBN + threadColInWarp * TN + i];
+      regN[wSubtileColIdx * TN + i] = Bs[(dotIdx * BN) + warpCol * WN + wSubtileColIdx * WSUBN + threadColInWarp * TN + i];
     }
   }
 
@@ -125,7 +126,7 @@ __device__ void processFromSmem(float *regM, float *regN, float *threadResults, 
           Finally, WNITER * TN is multiplied with the M part because we have WNITER * WMITER subtiles and WMITER is 1, 
           TN is for the row width for each subtile entry.
           */
-          threadResults[(wSubtileRowIdx * TM + resIdxM) * (WNITER * TN) + (wSubtileColIdx * TN) + resIdxN] = 
+          threadResults[(wSubtileRowIdx * TM + resIdxM) * (WNITER * TN) + (wSubtileColIdx * TN) + resIdxN] +=
           regM[(wSubtileRowIdx * TM) + resIdxM] * regN[(wSubtileColIdx * TN) + resIdxN];
         }
       } 
@@ -137,7 +138,7 @@ __device__ void processFromSmem(float *regM, float *regN, float *threadResults, 
 }
                 }
 
-} // namespace ws
+} // namespace wt
 
 // warp tile kernel, should be much faster
 /*
@@ -194,21 +195,21 @@ __global__ void __launch_bounds__(NUM_THREADS)
 
   //set A, B to correct offset
   A += blockIdxM * BM * K;
-  B += blockIdxN * BN * K;
+  B += blockIdxN * BN;
 
   // set C to warp output tile
-  C += (blockIdxM * BM + warpRow * WM) + blockIdxN * BN + warpCol * WN;
+  C += (blockIdxM * BM + warpRow * WM) * N + blockIdxN * BN + warpCol * WN;
 
   // set all the inner stuff + strides:
   // remember 4 float vectorized loads
-  int ARowSizeInf4 = BK / 4;
-  int BRowSizeInf4 = BN / 4;
-  int rowStrideA = NUM_THREADS  / ARowSizeInf4;
-  int rowStrideB = NUM_THREADS / BRowSizeInf4;
-  int innerRowA = threadIdx.x / ARowSizeInf4;
-  int innerColA = threadIdx.x % ARowSizeInf4;
-  int innerRowB = threadIdx.x / BRowSizeInf4;
-  int innerColB = threadIdx.x % BRowSizeInf4;
+  const int ARowSizeInf4 = BK / 4;
+  const int BRowSizeInf4 = BN / 4;
+  constexpr uint rowStrideA = NUM_THREADS  / ARowSizeInf4;
+  constexpr uint rowStrideB = NUM_THREADS / BRowSizeInf4;
+  const int innerRowA = threadIdx.x / ARowSizeInf4;
+  const int innerColA = threadIdx.x % ARowSizeInf4;
+  const int innerRowB = threadIdx.x / BRowSizeInf4;
+  const int innerColB = threadIdx.x % BRowSizeInf4;
 
   // using the smem tiles, use our indices + a short loop on TM, TN to do our acc
   float threadResults[TM * WMITER * TN * WNITER] = {0.0};
@@ -237,7 +238,7 @@ __global__ void __launch_bounds__(NUM_THREADS)
       float *C_moved = C + (wSubRowIdx * WSUBM) * N + wSubColIdx * WSUBN;
       for(int rthreadRow = 0; rthreadRow < TM; ++rthreadRow) {
         for(int rthreadCol = 0; rthreadCol < TN; rthreadCol += 4) {
-          float4 tmp = reinterpret_cast<float4 *>(&C_moved[(threadRowInWarp * TM + rthreadRow) * N + threadColInWarp * TN + rthreadCol]);
+          float4 tmp = reinterpret_cast<float4 *>(&C_moved[(threadRowInWarp * TM + rthreadRow) * N + threadColInWarp * TN + rthreadCol])[0];
 
           const int i = (wSubRowIdx * TM + rthreadRow) * (WNITER * TN) + wSubColIdx * TN + rthreadCol;
 
@@ -258,10 +259,20 @@ __global__ void __launch_bounds__(NUM_THREADS)
 
 extern "C" int gemm_launch_2(const float *A, const float *B, float *C, int M,
                              int N, int K, float alpha, float beta) {
+  const int BM = 128;
+  const int BN = 128;
+  const int BK = 16;
+  const int WM = 64;
+  const int WN = 32;
+  const int WNITER = 2;
+  const int TM = 8;
+  const int TN = 4;
+  const int NUM_THREADS = 256;
+
   dim3 gridDim(CEIL_DIV(M, BM), CEIL_DIV(N, BN), 1);
   dim3 blockDim(NUM_THREADS, 1, 1);
 
-  gemm_kernel_2<128, 128, 16, 64, 32, 2, 8, 4, 256><<<gridDim, blockDim>>>(M, N, K, alpha, A, B,
+  gemm_kernel_2<BM, BN, BK, WM, WN, WNITER, TM, TN, NUM_THREADS><<<gridDim, blockDim>>>(M, N, K, alpha, A, B,
   beta, C);
 
   cudaError_t err = cudaGetLastError();
